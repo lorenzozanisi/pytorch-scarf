@@ -1,0 +1,15 @@
+data:
+  train: "/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/Active_Continual_Learning/data/train_data_raw_2.pkl"
+  validation: "/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/Active_Continual_Learning/data/valid_data_raw_2.pkl"
+  test: "/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/Active_Continual_Learning/data/test_data_raw_2.pkl"
+  pool: "/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/Active_Continual_Learning/data/pool_data_raw_2.pkl"
+save_paths:
+  plots: "/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/Active_Continual_Learning/plots/"
+  outputs: "/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/Active_Continual_Learning/outputs/"
+
+
+
+
+fluxes:  [ "efiitg_gb"] #, "efeitg_gb_div_efiitg_gb","pfiitg_gb_div_efiitg_gb","pfeitg_gb_div_efiitg_gb","vfiitg_gb_div_efiitg_gb"] # 
+#fluxes: ["efiitg_gb"]
+                                    
