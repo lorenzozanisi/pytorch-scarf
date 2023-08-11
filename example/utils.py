@@ -32,6 +32,27 @@ def train_epoch(model, criterion, train_loader, optimizer, device, epoch):
 
     return epoch_loss / len(train_loader.dataset)
 
+def valid_epoch(model, criterion, valid_loader, optimizer, device, epoch):
+    model.train()
+    epoch_loss = 0.0
+    batch = tqdm(valid_loader, desc=f"Epoch {epoch}", leave=False)
+
+    for anchor, positive in batch:
+        anchor, positive = anchor.to(device), positive.to(device)
+
+        # reset gradients
+        optimizer.zero_grad()
+
+        # get embeddings
+        emb_anchor, emb_positive = model(anchor, positive)
+
+        # compute loss
+        loss = criterion(emb_anchor, emb_positive)
+        # log progress
+        epoch_loss += anchor.size(0) * loss.item()
+        batch.set_postfix({"loss": loss.item()})
+
+    return epoch_loss / len(valid_loader.dataset)
 
 def dataset_embeddings(model, loader, device):
     model.eval()
@@ -42,7 +63,7 @@ def dataset_embeddings(model, loader, device):
             anchor = anchor.to(device)
             embeddings.append(model.get_embeddings(anchor))
 
-    embeddings = torch.cat(embeddings).numpy()
+    embeddings = torch.cat(embeddings).detach().cpu().numpy()
 
     return embeddings
 

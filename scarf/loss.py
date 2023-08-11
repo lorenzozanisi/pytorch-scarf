@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class NTXent(nn.Module):
-    def __init__(self, temperature=1.0):
+    def __init__(self, temperature=1.0, device='cuda'):
         """NT-Xent loss for contrastive learning using cosine distance as similarity metric as used in [SimCLR](https://arxiv.org/abs/2002.05709).
         Implementation adapted from https://theaisummer.com/simclr/#simclr-loss-implementation
 
@@ -13,6 +13,7 @@ class NTXent(nn.Module):
         """
         super().__init__()
         self.temperature = temperature
+        self.device = device
 
     def forward(self, z_i, z_j):
         """Compute NT-Xent loss using only anchor and positive batches of samples. Negative samples are the 2*(N-1) samples in the batch
@@ -33,8 +34,8 @@ class NTXent(nn.Module):
         sim_ij = torch.diag(similarity, batch_size)
         sim_ji = torch.diag(similarity, -batch_size)
         positives = torch.cat([sim_ij, sim_ji], dim=0)
-
-        mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=torch.bool)).float()
+        
+        mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=torch.bool)).float().to(self.device)
         numerator = torch.exp(positives / self.temperature)
         denominator = mask * torch.exp(similarity / self.temperature)
 

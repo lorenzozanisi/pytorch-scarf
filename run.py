@@ -1,29 +1,96 @@
-from dataset import ExampleDataset
+from dataset import ExampleDataset, MyDataset
 from pipeline.data import get_data
 import argparse
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import Adam
+import pickle
+import matplotlib.pylab as plt
 from scarf.loss import NTXent
-from scarf.model import SCARF
+from scarf.model import SCARF, Classifier, FineTuneClassifier
 import yaml
-from pipeline.Models import Classifier
-from pipeline_tools import train_classifier_fn
 import numpy as np
 import copy
-from pipeline.utiles import results
+import coloredlogs
+import verboselogs
+import pipeline.pipeline_tools as pt
+import pandas as pd
+from pipeline.utils import output_dict
 from pipeline.data import DataConverter
+import logging
+from pipeline.utils import train_keys_store
+from typing import Union
+from example.utils import train_epoch, dataset_embeddings, valid_epoch
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import os
+import torch.multiprocessing as mp
 
 
-class FineTuneClassifier(Classifier):
-    def __init__(self, encoder, inputs=15, outputs=1, device=None,model_size: int = 8, dropout: float = 0.1):
-        super.__init__(inputs=15, outputs=1, device=None,model_size = 8, dropout  = 0.1)
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
 
-        self.model = torch.nn.Sequential(encoder, self.model)
-    
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
 
 
-def run(cfg):
+def train_classifier_fn(model, train_loader, valid_loader, lr=None, epochs=None, patience=None,**cfg):
+    # instantiate optimiser
+    opt = torch.optim.Adam(
+        model.parameters(), lr=lr, weight_decay=1.0e-4)
+    train_loss = []
+    train_acc = []
+    val_loss = []
+    val_acc = []
+    missed_loss = []
+    missed_acc = []
+
+    count = 0
+    best_loss = np.inf
+    for epoch in range(epochs):
+
+        logging.debug(f"Train Step: {epoch}")                
+        loss, acc = model.train_step(
+            train_loader, opt, epoch=epoch
+        )
+        train_loss.append(loss.item())
+        train_acc.append(acc)
+
+        validation_loss, validation_accuracy = model.validation_step(
+            valid_loader)
+        val_loss.append(validation_loss)
+        val_acc.append(validation_accuracy)
+        logging.debug(
+            f"Classifier training. Epoch {epoch}, train loss {loss}, val_loss {val_loss} "
+            )
+
+        if epoch==0:
+            best_model = model
+        if val_loss[-1]<best_loss:
+            best_model = copy.deepcopy(model)
+        else:
+            count+=1
+            if count>patience:
+                break
+
+    return best_model  # [train_loss, val_loss], [train_acc, val_acc]
+
+def run(cfg, use_pretrained_embeddings=False):
+
+    cfg['use_classifier'] = True
+    cfg['dropout'] = 0 
+    encoder_depth = 4
+    head_depth = 2    
+    cfg['model_size'] = encoder_depth+head_depth
+    cfg['flux'] = 'efiitg_gb'
+    cfg['classifier_type'] = 'SingleClassifier'
+    print(cfg)
+
+    print('Loading data')
     (
         train_sample,
         train_classifier,
@@ -35,23 +102,24 @@ def run(cfg):
         scaler,
     ) = get_data(cfg) 
 
-    finetune_fracs = np.arange(0.1,1,0.1)
+    logging.debug(f"{train_classifier.data['stable_label']}")
+    finetune_fracs = np.arange(0.1,1,0.2)
     finetune_names = [f'finetune_{frac}' for frac in finetune_fracs]
-
-    results = {name: results for name in ['full dataset']+finetune_names}
+    batch_size = 128
+    results = {name: copy.deepcopy(output_dict) for name in ['full dataset']+finetune_names}
     # --- train CLS on full dataset
-    fulldataclassifier = Classifier(dropout=0, model_size=6)
-    converter = DataConverter(gkmodel=cfg['gkmodel'])
-    fulldata_train_loader = converter.pandas_to_numpy_data(
-                train_classifier, batch_size=batch_size, shuffle=True
-            )
-    valid_loader = converter.pandas_to_numpy_data(
-                valid_classifier, batch_size=batch_size, shuffle=True
-            )        
-    test_loader = converter.pandas_to_numpy_data(
-                holdout_classifier, batch_size=batch_size, shuffle=True
-            )            
-    fulldataclassifier, _ = train_classifier_fn(fulldata_train_loader,valid_loader,model=fulldataclassifier,**cfg)    
+
+    devices = dict(
+        zip(cfg['fluxes'], ['cuda' for i in range(len(cfg['fluxes']))])
+    )    
+
+    converter = DataConverter(cfg['gkmodel'])
+    train_loader = converter.pandas_to_numpy_data(train_classifier)
+    valid_loader = converter.pandas_to_numpy_data(valid_classifier)
+    test_loader = converter.pandas_to_numpy_data(holdout_classifier)
+
+    fulldataclassifier = pt.get_classifier_model(**cfg)
+    fulldataclassifier = train_classifier_fn(model = fulldataclassifier, train_loader=train_loader, valid_loader=valid_loader,**cfg)
     _, fulldatalosses = fulldataclassifier.predict(test_loader)
 
     results['full dataset']["accuracy"].append(fulldatalosses[1])
@@ -59,67 +127,153 @@ def run(cfg):
     results['full dataset']["recall"].append(fulldatalosses[3])
     results['full dataset']["f1"].append(fulldatalosses[4])
     results['full dataset']["auc"].append(fulldatalosses[5])
-    
+    logging.debug(f"full data results {results['full dataset']}")
     
     # --- now pretrain only on input space using SCARF
-    train_classifier_ssl = copy.deepcopy(train_classifier)
-    train_classifier_ssl.data = train_classifier_ssl.data.drop(columns='efiitg_gb')
-    train_ds = ExampleDataset(train_classifier_ssl.data, target="stable_label")
+    train_keys = train_keys_store(cfg['gkmodel'])       
+    train_classifier_ssl_inputs = train_classifier.data[train_keys].values
+    train_classifier_ssl_targets = train_classifier.data['stable_label'].values # -- seems unnecessary for ssl?
+    valid_classifier_ssl_inputs = valid_classifier.data[train_keys].values
+    valid_classifier_ssl_targets = valid_classifier.data['stable_label'].values # -- seems unnecessary for ssl?
+    test_classifier_ssl_inputs = holdout_classifier.data[train_keys].values
+    test_classifier_ssl_targets = holdout_classifier.data['stable_label'].values # -- seems unnecessary for ssl?    
 
-    batch_size = 128
-    epochs = 5000
+    train_ds = ExampleDataset(
+                            train_classifier_ssl_inputs,
+                            )
+    valid_ds = ExampleDataset(
+                            valid_classifier_ssl_inputs,
+                            )
+    test_ds = ExampleDataset(
+                            test_classifier_ssl_inputs,
+                            )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
+    emb_dim = 512
+
     model = SCARF(
         input_dim=train_ds.shape[1],
-        emb_dim=512,
-        encoder_depth=4, 
+        emb_dim=emb_dim,
+        encoder_depth=encoder_depth, 
         head_depth=2,        
-        corruption_rate=0.5,
+        corruption_rate=0.2,
     ).to(device)
-    optimizer = Adam(model.parameters(), lr=0.001)
-    ntxent_loss = NTXent()
-
+    optimizer = Adam(model.parameters(), lr=0.0001)
+    ntxent_loss = NTXent(device=device)
+    
+    epochs = 1000
+    loss_history = []
+    valid_loss_history = []
     for epoch in range(1, epochs + 1):
-        for anchor, positive in train_loader:
-                anchor, positive = anchor.to(device), positive.to(device)
+        epoch_loss = train_epoch(model, ntxent_loss, train_loader, optimizer, device, epoch)
+        loss_history.append(epoch_loss)
+        # valid_loss = valid_epoch(model, ntxent_loss, valid_loader, optimizer, device, epoch)
+        # valid_loss_history.append(epoch_loss)
 
-                # reset gradients
-                optimizer.zero_grad()
-
-                # get embeddings
-                emb, emb_corrupted = model(anchor, positive)
-
-                # compute loss
-                loss = ntxent_loss(emb, emb_corrupted)
-                loss.backward()
-
-                # update model weights
-                optimizer.step()
+    plt.plot(np.arange(epochs), loss_history)
+    plt.savefig('/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/pytorch-scarf/plots/pretrain_loss.png')
+    plt.close()
 
     
     # --- finetune using progressively higher fractions of dataset
 
+    if use_pretrained_embeddings:
+        train_embeddings = dataset_embeddings(model, train_loader, device)
+        valid_embeddings = dataset_embeddings(model, valid_loader, device)
+        test_embeddings = dataset_embeddings(model, test_loader, device)
+
+        train_embeddings = pd.DataFrame(train_embeddings)
+        valid_embeddings = pd.DataFrame(valid_embeddings)
+        test_embeddings = pd.DataFrame(test_embeddings)
+
+        train_data_finetune = MyDataset(train_embeddings, pd.DataFrame(train_classifier_ssl_targets))
+        valid_data_finetune = MyDataset(valid_embeddings,pd.DataFrame(valid_classifier_ssl_targets))
+        test_data_finetune = MyDataset(test_embeddings, pd.DataFrame(test_classifier_ssl_targets))
+
+    else:
+        train_data_finetune = MyDataset(pd.DataFrame(train_classifier_ssl_inputs), pd.DataFrame(train_classifier_ssl_targets))
+        valid_data_finetune = MyDataset(pd.DataFrame(valid_classifier_ssl_inputs),pd.DataFrame(valid_classifier_ssl_targets))
+        test_data_finetune = MyDataset(pd.DataFrame(test_classifier_ssl_inputs), pd.DataFrame(test_classifier_ssl_targets))
+        emb_dim = len(train_keys)
+
+    valid_loader = DataLoader(valid_data_finetune, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_data_finetune, batch_size=batch_size, shuffle=False)
+
+    # --- temporary!
+    # train_data_finetune = MyDataset(pd.DataFrame(train_classifier_ssl_inputs), pd.DataFrame(train_classifier_ssl_targets))
+    # valid_data_finetune = MyDataset(pd.DataFrame(valid_classifier_ssl_inputs), pd.DataFrame(valid_classifier_ssl_targets))
+    # test_data_finetune = MyDataset(pd.DataFrame(test_classifier_ssl_inputs), pd.DataFrame(test_classifier_ssl_targets))
+    # valid_loader = DataLoader(valid_data_finetune, batch_size=batch_size, shuffle=False)
+    # test_loader = DataLoader(test_data_finetune, batch_size=batch_size, shuffle=False)
     for frac in finetune_fracs:
-        this_model = copy.deepcopy(model)
-        finetuneclassifier = FineTuneClassifier(this_model.encoder,dropout=0, model_size=2) # --- make the overall model with the same num of params as the vanilla fulldata cls
-        finetune_train_classifier = copy.deepcopy(train_classifier)
-        finetune_train_classifier.data = finetune_train_classifier.data.sample(frac=frac)
-        train_loader = converter.pandas_to_numpy_data(
-                    finetune_train_classifier, batch_size=batch_size, shuffle=True
-                )
-        finetuneclassifier, _ = train_classifier_fn(train_loader,valid_loader,model=finetuneclassifier,**cfg)
+        # logging.debug(f'Finetune frac {frac}')
+        if not use_pretrained_embeddings:
+            finetuneclassifier = FineTuneClassifier(inputs=512,encoder=model.encoder, dropout=0, base_model_size=head_depth, device=device)
+        else:
+            finetuneclassifier = Classifier(inputs=emb_dim, dropout=0, model_size=head_depth, device=device) # --batch_size- make the overall model with the same num of params as the vanilla fulldata cls
+        temp_train_classifier = copy.deepcopy(train_data_finetune)
+        temp_train_classifier.sample(frac=frac) #--- sample is inplace
+
+        #finetuneclassifier = Classifier(inputs=15, dropout=0, model_size=2, device=device)
+        
+        train_loader = DataLoader(temp_train_classifier, batch_size=batch_size, shuffle=True)
+
+        finetuneclassifier = train_classifier_fn(model = finetuneclassifier, train_loader=train_loader, valid_loader=valid_loader,**cfg)
+        _, fulldatalosses = finetuneclassifier.predict(test_loader)
 
         results[f'finetune_{frac}']["accuracy"].append(fulldatalosses[1])
         results[f'finetune_{frac}']["precision"].append(fulldatalosses[2])
         results[f'finetune_{frac}']["recall"].append(fulldatalosses[3])
         results[f'finetune_{frac}']["f1"].append(fulldatalosses[4])
-        results[f'finetune_{frac}']["auc"].append(fulldatalosses[5])        
-    
-if __name__=='__main__':
+        results[f'finetune_{frac}']["auc"].append(fulldatalosses[5]) 
+        logging.debug(f"results for finetune frac of {frac}: {results[f'finetune_{frac}']}")
+    with open('/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/pytorch-scarf/results.pkl', 'wb') as f:
+         pickle.dump(results,f)
+    plt.scatter(finetune_fracs, [results[f'finetune_{frac}']["f1"] for frac in finetune_fracs], label='With pretraining') 
+    plt.scatter([1], results['full dataset']['f1'], color='red', label='No pretraining')      
+    plt.ylabel('F1')
+    plt.xlabel('Fraction of dataset used')
+    plt.legend()
+    plt.savefig('/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/pytorch-scarf/plots/f1s.png')
+    plt.close()
 
+    plt.scatter(finetune_fracs, [results[f'finetune_{frac}']["accuracy"] for frac in finetune_fracs], label='With pretraining') 
+    plt.scatter([1], results['full dataset']['accuracy'], color='red', label='No pretraining')      
+    plt.ylabel('Accuracy')
+    plt.xlabel('Fraction of dataset used')
+    plt.legend()
+    plt.savefig('/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/pytorch-scarf/plots/accuracies.png')
+    plt.close()
+
+    plt.scatter(finetune_fracs, [results[f'finetune_{frac}']["precision"] for frac in finetune_fracs], label='With pretraining') 
+    plt.scatter([1], results['full dataset']['precision'], color='red', label='No pretraining')      
+    plt.ylabel('Precision')
+    plt.xlabel('Fraction of dataset used')
+    plt.legend()
+    plt.savefig('/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/pytorch-scarf/plots/precisions.png')
+    plt.close()
+
+    plt.scatter(finetune_fracs, [results[f'finetune_{frac}']["recall"] for frac in finetune_fracs], label='With pretraining') 
+    plt.scatter([1], results['full dataset']['recall'], color='red', label='No pretraining')      
+    plt.ylabel('Recall')
+    plt.xlabel('Fraction of dataset used')
+    plt.legend()
+    plt.savefig('/home/ir-zani1/rds/rds-ukaea-ap001/ir-zani1/qualikiz/pytorch-scarf/plots/recalls.png')
+    plt.close()
+
+
+
+
+
+if __name__=='__main__':
+    logging.getLogger("PIL").setLevel(
+        logging.WARNING)  
+    verboselogs.install()
+    logger = logging.getLogger(__name__)
+    coloredlogs.install(level="DEBUG")
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--default_config",
                         help="config file", required=True)
@@ -201,21 +355,21 @@ if __name__=='__main__':
     parser.add_argument(
         "--train_size",
         help="The training set size",
-        default=5000,
+        default=100000,
         required=False,
         type=int,
     )
     parser.add_argument(
         "--valid_size",
         help="The validation set size",
-        default=20_000,
+        default=20000,
         required=False,
         type=int,
     )
     parser.add_argument(
         "--test_size",
         help="The test set size",
-        default=50_000,
+        default=50000,
         required=False,
         type=int,
     )
@@ -232,12 +386,6 @@ if __name__=='__main__':
     parser.add_argument(
         "--batch_size", help="The batch size", default=256, required=False, type=int
     )
-    parser.add_argument(
-        "--acquisition",
-        help="The acquisition function, choose between 'uncertainty' and 'random'",
-        default="uncertainty",
-        required=True,
-    )  # 'uncertainty','random'
 
     parser.add_argument(
         "--gkmodel",
@@ -257,7 +405,7 @@ if __name__=='__main__':
         "--regressor_type", default="ParallelDeepEnsemble", required=False
     )  # 'SingleRegressor','EnsembleRegressor', 'DeepEnsemble','ParallelDeepEnsemble'
     parser.add_argument(
-        "--classifier_type", default="ParallelEnsembleClassifier", required=False
+        "--classifier_type", default="SingleClassifier", required=False
     )  # 'SingleClassifier','ParallelEnsembleClassifier'
     parser.add_argument(
         "--uncertainty_estimate",
@@ -385,4 +533,4 @@ if __name__=='__main__':
     input_cfg = vars(args)
     cfg.update(input_cfg)
 
-    run(cfg=cfg)
+    run(cfg=cfg, use_pretrained_embeddings=False)
